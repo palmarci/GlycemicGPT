@@ -414,6 +414,11 @@ class AndroidMedtronicGattLink(
                 // have been replaced by a reconnect meanwhile. The old connection's subscriptions died
                 // with it, so skip rather than disable a characteristic on the new connection.
                 if (link !== sub.ownerGatt) return
+                // A deferred unsubscribe cleanup raced with a new session that already
+                // re-subscribed this characteristic. Don't disable — the new session is
+                // actively using it. The handler was already unlinked from the old session
+                // when unsubscribe() removed it, so no stale callbacks can fire.
+                if (handlers.containsKey(sub.resolved.characteristic.uuid)) return
                 val char = sub.resolved.characteristic
                 if (!link.setCharacteristicNotification(char, false)) {
                     Timber.w("Medtronic GATT %s: setCharacteristicNotification(false) was rejected", op)
