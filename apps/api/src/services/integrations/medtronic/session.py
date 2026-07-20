@@ -27,8 +27,8 @@ from .client import US_BASE_URL, CareLinkAuthError, CareLinkError
 
 _ALLOWED_HOST_SUFFIXES = ("minimed.com", "minimed.eu")
 _UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) FxQuantum/152.0 "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Safari/605.1.15"
 )
 # Refresh this many seconds before the token's stated expiry, to avoid racing
 # a request against expiry.

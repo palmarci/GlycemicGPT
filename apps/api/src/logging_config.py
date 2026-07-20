@@ -128,6 +128,9 @@ def setup_logging(
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
+    # Full httpx wire logging for debugging CareLink requests
+    logging.getLogger("httpx").setLevel(logging.DEBUG)
+    logging.getLogger("httpcore").setLevel(logging.DEBUG)
 
 class StructuredLogger:
     """Logger wrapper that supports structured extra fields."""

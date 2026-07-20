@@ -26,10 +26,11 @@ reportStatus *response* body. These are marked inline.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlparse
 
 import httpx
@@ -59,10 +60,11 @@ BearerProvider = Callable[[], Awaitable[str]]
 
 #: A browser User-Agent for CareLink requests. The web app is fronted by
 #: CloudFront, whose bot rules can 403 a non-browser UA (httpx's default) on the
-#: report POST while leaving GETs alone (#811). Mirrors session.py's UA.
+#: report POST while leaving GETs alone (#811). Confirmed working from a real
+#: Firefox Quantum browser session against the EU host (csv.har).
 _BROWSER_UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) FxQuantum/152.0 "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Safari/605.1.15"
 )
 
 # reportStatus "ready" signals. We observed the generateReport ->
@@ -122,7 +124,11 @@ def _first(d: dict, *keys: str) -> object | None:
 #: Request headers safe to log verbatim when a CareLink call fails. Used to
 #: confirm what we actually put on the wire (e.g. Origin/Referer presence on the
 #: generateReport POST, #811). Credential-bearing headers are never logged.
-_LOGGABLE_REQUEST_HEADERS = ("origin", "referer", "accept", "content-type")
+_LOGGABLE_REQUEST_HEADERS = (
+    "origin", "referer", "accept", "content-type",
+    "user-agent", "accept-language", "accept-encoding", "cache-control", "pragma",
+    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+)
 
 
 def _cookie_names(value: str) -> str:
@@ -238,20 +244,27 @@ class CareLinkClient:
             "Referer": self._referer,
             # Last observable gaps vs the browser's working request (#811): a
             # browser User-Agent (CloudFront/WAF bot rules commonly 403 a
-            # non-browser UA on the report POST while letting GETs through) and
-            # the charset the browser sends on the JSON body.
+            # non-browser UA on the report POST while letting GETs through), the
+            # charset the browser sends on the JSON body, Accept-Language
+            # (the EU origin may check it), and Cache-Control/Pragma that the
+            # browser sends on every request.
             "User-Agent": _BROWSER_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
             "Content-Type": "application/json; charset=utf-8",
+            # Fetch metadata headers the browser sends automatically; the
+            # CareLink origin may check for them on POST (#811).
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
 
     def _check(self, resp: httpx.Response) -> None:
         snippet = _error_body_snippet(resp)
         body = f" - {snippet}" if snippet else ""
         if resp.status_code >= 400:
-            # Log what we actually sent (credentials masked) so an EU 403 on the
-            # generateReport POST can be checked for the same-origin headers the
-            # host requires -- the outbound request never shows in the app log
-            # otherwise (#811).
             logger.warning(
                 "CareLink request failed",
                 method=resp.request.method,
@@ -260,10 +273,6 @@ class CareLinkClient:
                 sent_headers=_redacted_request_headers(resp.request),
             )
         if resp.status_code in (401, 403):
-            # 401 (expired token) and 403 (authenticated but not permitted, e.g.
-            # a forbidden action/format on an otherwise-valid session) both land
-            # here. Carry the upstream body so the reason is visible -- the two
-            # are indistinguishable by status alone (#811).
             raise CareLinkAuthError(
                 f"CareLink auth/permission denied on {resp.request.url.path} "
                 f"({resp.status_code}){body}"
@@ -282,10 +291,29 @@ class CareLinkClient:
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES_429 + 1):
             try:
+                req_headers = await self._headers()
+                safe = {k: ("<redacted>" if k.lower() in ("authorization", "cookie") else v)
+                        for k, v in req_headers.items()}
+                logging.getLogger(__name__).debug(
+                    "CareLink %s %s headers=%s", method, path, safe
+                )
+                if json is not None:
+                    logging.getLogger(__name__).debug(
+                        "CareLink %s %s body=%s", method, path, json
+                    )
+                # Log actual cookies from the client jar
+                jar_cookies = list(self._client.cookies.jar)
+                cookie_str = "; ".join(
+                    f"{c.name}={c.value[:20]}..."
+                    for c in jar_cookies
+                ) if jar_cookies else "(empty)"
+                logging.getLogger(__name__).debug(
+                    "CareLink %s %s cookie_jar=%s", method, path, cookie_str
+                )
                 resp = await self._client.request(
                     method,
                     f"{self._base_url}{path}",
-                    headers=await self._headers(),
+                    headers=req_headers,
                     json=json,
                     **kwargs,
                 )
@@ -361,6 +389,26 @@ class CareLinkClient:
         Raises CareLinkReportTimeoutError if the job doesn't finish in the poll
         budget, CareLinkAuthError on 401/403, CareLinkError otherwise.
         """
+        # Warmup: the browser makes several requests before generateReport to
+        # set session state (#811). Non-fatal — failures are logged but don't
+        # abort the import; the main request may still succeed.
+        country = self._client.cookies.get("application_country")
+        for req in [
+            ("GET", "/patient/requestPreferences", None),
+            ("GET", f"/patient/reports/supported?countryCode={country}", None) if country else None,
+            ("POST", "/patient/reports/snapshotTimelinesForCalendar",
+             {"from": "2016-01-01", "to": end_date.strftime("%Y-%m-%d"), "patientId": patient_id}),
+        ]:
+            if req is None:
+                continue
+            method, path, body = req
+            try:
+                if method == "GET":
+                    await self._get(path)
+                else:
+                    await self._post(path, json=body)
+            except CareLinkError:
+                logger.warning("CareLink warmup %s %s failed (non-fatal)", method, path)
         body = self._build_generate_report_body(
             patient_id, start_date, end_date, client_time
         )
@@ -411,17 +459,17 @@ class CareLinkClient:
         end_date: date,
         client_time: datetime | None = None,
     ) -> dict:
-        """Mirror the observed generateReport body: CSV only, all PDF report
-        sections off, aggregated CSV enabled.
+        """Mirror the observed generateReport body from the browser CSV export.
 
-        Deliberately omits the ``*PeriodB`` comparison window. It was tried
-        (#811) because a captured EU UI request carried it, but that capture was
-        a *PDF comparison report*; the EU CSV-export endpoint rejects the field
-        with ``400 {"field":"startDatePeriodB","message":"not.required"}``
-        (confirmed live). The earlier 400 was actually a fractional-second
-        ``clientTime`` (see below), which masked this until the body parsed.
+        Includes the ``*PeriodB`` comparison window. It was tried and initially
+        thought to cause a 400, but the earlier 400 was actually from a
+        fractional-second ``clientTime`` which masked the real cause (#811).
+        The browser CSV export sends PeriodB; omitting it may cause a 403.
         Assumes start_date <= end_date (enforced upstream by MedtronicImportRequest).
         """
+        delta = end_date - start_date
+        period_b_end = start_date - timedelta(days=1)
+        period_b_start = period_b_end - delta
         return {
             # Seconds precision (no microseconds): the EU report host rejects a
             # fractional-second clientTime with a 400 "Malformed JSON in request
@@ -430,24 +478,29 @@ class CareLinkClient:
             "clientTime": (client_time or datetime.now(UTC)).isoformat(
                 timespec="seconds"
             ),
-            "dailyDetailReportDays": [],
+            "dailyDetailReportDays": [
+                (start_date + timedelta(days=i)).strftime("%Y-%m-%d")
+                for i in range(delta.days, -1, -1)
+            ],
             "patientId": patient_id,
             "reportFileFormat": "CSV",
             "aggregatedCsvEnabled": True,
-            "reportShowAdherence": False,
-            "reportShowAssessmentAndProgress": False,
-            "reportShowBolusWizardFoodBolus": False,
-            "reportShowDashBoard": False,
+            "reportShowAdherence": True,
+            "reportShowAssessmentAndProgress": True,
+            "reportShowBolusWizardFoodBolus": True,
+            "reportShowDashBoard": True,
             "reportShowDataTable": False,
-            "reportShowDeviceSettings": False,
-            "reportShowEpisodeSummary": False,
-            "reportShowLogbook": False,
-            "reportShowOverview": False,
-            "reportShowWeeklyReview": False,
+            "reportShowDeviceSettings": True,
+            "reportShowEpisodeSummary": True,
+            "reportShowLogbook": True,
+            "reportShowOverview": True,
+            "reportShowWeeklyReview": True,
             "reportShowSettingsHistory": False,
             "reportShowInsulinAssessment": False,
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
+            "startDatePeriodB": period_b_start.strftime("%Y-%m-%d"),
+            "endDatePeriodB": period_b_end.strftime("%Y-%m-%d"),
         }
 
     @staticmethod
